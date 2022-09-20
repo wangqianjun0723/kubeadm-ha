@@ -1,0 +1,278 @@
+- name: 判断 Docker 是否早已安装
+  shell: >
+    systemctl status docker | grep running || echo "not running"
+  register: docker_already_running
+
+- name: 设置 container_manager_detected 变量
+  set_fact:
+    container_manager_detected: >-
+      {%- if "active" in docker_already_running.stdout -%}
+      docker
+      {%- else -%}
+      containerd
+      {%- endif -%}
+
+- name: 使用 kubeadm 重置节点
+  command: kubeadm reset -f
+  ignore_errors: true
+
+- name: 停止 kubelet 服务
+  service:
+    name: kubelet
+    state: stopped
+    enabled: no
+  ignore_errors: true
+
+- block:
+  - name: 停止运行的容器
+    ignore_errors: true
+    shell: "docker stop $(docker ps -aq)"
+    args:
+      executable: /bin/bash
+    register: remove_all_docker_containers
+    retries: 5
+    until: remove_all_docker_containers.rc == 0
+    delay: 5
+  
+  - name: 清理 docker 相关数据
+    shell: "docker system prune -a -f --volumes"
+    args:
+      executable: /bin/bash
+    register: remove_all_docker_data
+    retries: 5
+    until: remove_all_docker_data.rc == 0
+    delay: 5
+
+  - name: 停止 docker 服务
+    service:
+      name: docker
+      state: stopped
+      enabled: no
+    ignore_errors: true
+
+  - name: 收集 docker 挂载的目录
+    shell: set -o pipefail && mount | grep docker | awk '{print $3}' | tac
+    args:
+      executable: /bin/bash
+      warn: false
+    check_mode: no
+    register: docker_mounted_dirs
+    failed_when: false
+  
+  - name: 卸载 docker 挂载的目录
+    command: umount -f {{ item }}
+    with_items: "{{ docker_mounted_dirs.stdout_lines }}"
+    register: docker_umount_dir
+    when: docker_mounted_dirs
+    retries: 5
+    until: docker_umount_dir.rc == 0
+    delay: 5
+
+  when: container_manager_detected == "docker"
+
+- block:
+  - name:  停止运行的容器
+    shell: "set -o pipefail && crictl ps -aq | xargs -r crictl -t 60s stop"
+    args:
+      executable: /bin/bash
+    register: remove_all_cri_containers
+    retries: 5
+    until: remove_all_cri_containers.rc == 0
+    delay: 5
+    ignore_errors: true
+
+  - name: 删除所有容器
+    shell: "set -o pipefail && crictl ps -aq | xargs -r crictl -t 60s rm"
+    args:
+      executable: /bin/bash
+    register: remove_all_cri_containers
+    retries: 5
+    until: remove_all_cri_containers.rc == 0
+    delay: 5
+    ignore_errors: true
+
+  - name: 停止所有 cri pods
+    shell: "set -o pipefail && crictl pods -q | xargs -r crictl -t 60s stopp"
+    args:
+      executable: /bin/bash
+    register: remove_all_cri_containers
+    retries: 5
+    until: remove_all_cri_containers.rc == 0
+    delay: 5
+    ignore_errors: true
+  
+  - name: 移除所有 cri pods
+    shell: "set -o pipefail && crictl pods -q | xargs -r crictl -t 60s rmp"
+    args:
+      executable: /bin/bash
+    register: remove_all_cri_containers
+    retries: 5
+    until: remove_all_cri_containers.rc == 0
+    delay: 5
+    ignore_errors: true
+
+  - name: 清除所有镜像
+    shell: "set -o pipefail && crictl images -q | xargs crictl -t 60s rmi"
+    args:
+      executable: /bin/bash
+    register: remove_all_cri_containers
+    retries: 5
+    until: remove_all_cri_containers.rc == 0
+    delay: 5
+    ignore_errors: true
+
+  - name: 停止 containerd 服务
+    service:
+      name: containerd
+      state: stopped
+      enabled: no
+    ignore_errors: true
+  when: container_manager_detected == "containerd"
+
+- include_tasks: centos.yml
+  when: ansible_distribution in [ 'CentOS','OracleLinux','RedHat' ]
+
+- include_tasks: debian.yml
+  when: ansible_distribution in [ 'Ubuntu','Debian' ]
+
+- name: 收集 kubelet 挂载的目录
+  shell: set -o pipefail && mount | grep {{ kubelet_root_dir }} | awk '{print $3}' | tac
+  args:
+    executable: /bin/bash
+    warn: false
+  check_mode: no
+  register: mounted_dirs
+  failed_when: false
+
+- name: 卸载 kubelet 挂载的目录
+  command: umount -f {{ item }}
+  with_items: "{{ mounted_dirs.stdout_lines }}"
+  register: umount_dir
+  when: mounted_dirs
+  retries: 5
+  until: umount_dir.rc == 0
+  delay: 5
+
+- name: 删除 kubelet 相关文件或目录
+  file: 
+    name: "{{ item }}"
+    state: absent
+  with_items:
+    - "{{ ansible_env.HOME | default('/root') }}/.helm"
+    - "{{ ansible_env.HOME | default('/root') }}/.kube"
+    - "{{ containerd_storage_dir }}"
+    - "{{ docker_storage_dir }}"
+    - "{{ kubelet_root_dir }}"
+    - "{{ etcd_data_dir }}"
+    - /etc/calico
+    - /etc/cni
+    - /etc/containerd
+    - /etc/crictl.yaml
+    - /etc/docker
+    - /etc/flannel
+    - /etc/kubernetes
+    - /etc/modules-load.d/10-k8s-modules.conf
+    - /etc/sysctl.d/95-k8s-sysctl.conf
+    - /etc/systemd/system.conf.d/30-k8s-ulimits.conf
+    - /etc/systemd/system/containerd.service.d
+    - /etc/systemd/system/docker.service.d
+    - /etc/systemd/system/kubelet.service.d
+    - /opt/cni
+    - /opt/containerd
+    - /run/calico
+    - /run/flannel
+    - /run/kubernetes
+    - /usr/share/bash-completion/completions/docker
+    - /usr/share/bash-completion/completions/kubectl
+    - /var/lib/calico
+    - /var/lib/cni
+    - /var/lib/containerd
+    - /var/lib/docker
+    - /var/lib/etcd
+    - /var/lib/kubelet
+    - /var/log/calico
+    - /var/log/pods
+    - /var/run/docker.sock
+    # - /var/run/calico
+    # - /var/run/containerd
+    # - /var/run/docker
+    # - /var/run/kubelet
+    
+- name: 清理 iptables
+  shell: "{{ item }} || true"
+  with_items:
+  - iptables -F
+  - iptables -X
+  - iptables -F -t nat
+  - iptables -X -t nat
+  - iptables -F -t filter
+  - iptables -X -t filter
+  - iptables -F -t mangle
+  - iptables -X -t mangle
+
+- name: 刷新 iptables
+  iptables:
+    table: "{{ item }}"
+    flush: yes
+  with_items:
+    - filter
+    - nat
+    - mangle
+
+- name: 清理 ipvsadm
+  shell: "{{ item }} || true"
+  with_items:
+  - ipvsadm --clear
+
+- name: 清除虚拟网卡
+  shell: "{{ item }} || true"
+  with_items:
+  - ip link del docker0
+  - ip link del tunl0
+  - ip link del flannel.1
+  - ip link del cni0
+  - ip link del mynet0
+  - ip link del kube-bridge
+  - ip link del dummy0
+  - ip link del kube-ipvs0
+  - ip link del cilium_net
+  - ip link del cilium_vxlan
+  - ip link del ovn0
+  - ip link del ovs-system
+
+- name: 获取遗留路由规则
+  command: ip route show proto bird
+  changed_when: false
+  register: bird_routes
+
+- name: 删除遗留路由规则
+  command: "ip route del {{ bird_route }} proto bird"
+  with_items: "{{ bird_routes.stdout_lines }}"
+  loop_control:
+    loop_var: bird_route
+
+- name: 重新加载 daemon
+  systemd:
+    daemon_reload: yes
+
+- name: 移除添加的 hosts 信息
+  blockinfile:
+    path: "/etc/hosts"
+    state: absent
+    marker: "# Ansible inventory hosts {mark}"
+
+- name: 重启网络
+  systemd:
+    name: >-
+      {% if ansible_os_family == "RedHat" -%}
+      {%- if ansible_distribution_major_version|int == 8 -%}
+      NetworkManager
+      {%- else -%}
+      network
+      {%- endif -%}
+      {%- elif ansible_distribution == "Ubuntu" and ansible_distribution_release == "bionic" -%}
+      systemd-networkd
+      {%- elif ansible_os_family == "Debian" -%}
+      networking
+      {%- endif %}
+    state: restarted

@@ -1,0 +1,146 @@
+- name: 判断 Docker 是否早已安装
+  shell: >
+    systemctl status docker | grep running || echo "not running"
+  register: docker_already_running
+
+- name: 设置 container_manager_detected 变量
+  set_fact:
+    container_manager_detected: >-
+      {%- if "active" in docker_already_running.stdout -%}
+      docker
+      {%- else -%}
+      containerd
+      {%- endif -%}
+
+- name: 创建 kubelet 相关目录
+  file: 
+    name: "{{ item }}"
+    state: directory
+  with_items:
+  - "{{ kubelet_root_dir }}"
+  - /etc/systemd/system/kubelet.service.d
+
+- block:
+  - name: 在 etcd 节点创建 etcd 相关目录
+    file: 
+      name: "{{ item }}"
+      state: directory
+      owner: root
+      group: root
+      mode: 0700
+    with_items:
+    - "{{ etcd_data_dir }}"
+    - /etc/kubernetes/backup/etcd
+    - /etc/kubernetes/pki/etcd
+    - /etc/kubernetes/manifests
+
+  - name: 在 etcd 节点拉取相关镜像
+    shell: "{{ IMAGE_PULL_COMMAND }} {{ item }}"
+    with_items:
+    - "{{ etcd_image }}"
+    - "{{ pod_infra_container_image }}"
+
+  - name: 读取 etcd static pod yaml 文件 stat 信息
+    stat: 
+      path: /etc/kubernetes/manifests/etcd-external.yaml
+    register: etcd_static_pod_stat
+
+  - name: 生成 etcd static pod 文件
+    template: 
+      src: etcd-external.yaml.j2
+      dest: /etc/kubernetes/manifests/etcd-external.yaml
+      owner: root
+      mode: 0644
+    # when: not etcd_static_pod_stat.stat.exists
+  when: inventory_hostname in (groups['etcd'] + groups['new-etcd'])
+
+- name: 读取 kubelet.conf 文件 stat 信息
+  stat: 
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf_stat
+
+- block:
+  - name: 获取 Docker Cgroup Driver 值
+    shell: docker info --format '{{ '{{' }} json .CgroupDriver {{ '}}' }}' | cut -d'"' -f2
+    register: docker_cgroup_driver
+    when: container_manager_detected == 'docker'
+
+  - name: 设置 docker 为容器运行时 kubelet_cgroup_driver_detected 变量
+    set_fact:
+      kubelet_cgroup_driver_detected: >-
+        {{ docker_cgroup_driver.stdout }}
+    when: container_manager_detected == 'docker'
+
+  - name: 设置 containerd 为容器运行时 kubelet_cgroup_driver_detected 变量
+    set_fact:
+      kubelet_cgroup_driver_detected: >-
+        {%- if containerd_use_systemd_cgroup -%}systemd{%- else -%}cgroupfs{%- endif -%}
+    when: container_manager_detected == 'containerd'
+
+  - name: 生成临时 kubelet unit 文件
+    template: 
+      src: 20-kubelet-override.conf.j2
+      dest: /etc/systemd/system/kubelet.service.d/20-kubelet-override.conf
+      owner: root
+      mode: 0644
+
+  - name: 重新加载 daemon
+    systemd:
+      daemon_reload: yes
+
+  - name: 临时启动 kubelet 以引导 etcd 运行
+    service:
+      name: kubelet
+      state: restarted
+      enabled: yes
+
+  when: 
+  - inventory_hostname in (groups['etcd'] + groups['new-etcd'])
+  - not kubelet_conf_stat.stat.exists
+
+- include_tasks: docker.yml
+  when: container_manager_detected == 'docker'
+
+- include_tasks: containerd.yml
+  when: container_manager_detected == 'containerd'
+
+- block:
+  - name: 移除临时 kubelet unit 文件
+    file: 
+      name: /etc/systemd/system/kubelet.service.d/20-kubelet-override.conf
+      state: absent
+
+  - name: 重新加载 daemon
+    systemd:
+      daemon_reload: yes
+  - name: 停止临时启动 kubelet
+    service:
+      name: kubelet
+      state: stopped
+      enabled: yes
+  when: 
+  - inventory_hostname in (groups['kube-master'] + groups['kube-worker'] + groups['new-master'] + groups['new-worker']) 
+  - not kubelet_conf_stat.stat.exists
+
+- block:
+  - name: 第一个 etcd 节点创建 etcd 备份工具
+    template: 
+      src: etcdtools.j2
+      dest: /etc/kubernetes/backup/etcd/etcdtools
+      owner: root
+      mode: 0755
+  - name: 第一个 etcd 节点创建 etcd 定时备份 crontab
+    cron: 
+      minute: "0"
+      hour: "{{ etcd_backup_hour }}"
+      name: Backup etcd databases
+      job: >
+        /etc/kubernetes/backup/etcd/etcdtools backup
+  - name: 第一个 etcd 节点创建清理 etcd 定时备份文件 crontab
+    cron: 
+      minute: "30"
+      hour: "{{ etcd_backup_hour }}"
+      name: Clean etcd databases backup file
+      job: >
+        /etc/kubernetes/backup/etcd/etcdtools cleanup
+  when: inventory_hostname == groups['etcd'][0]
